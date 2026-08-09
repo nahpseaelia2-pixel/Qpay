@@ -24,6 +24,8 @@ import os
 import uuid
 from decimal import Decimal
 
+import httpx
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -68,6 +70,17 @@ app.add_middleware(
 QPAY_ENV = os.environ.get("QPAY_ENV", "sandbox")
 CALLBACK_BASE_URL = os.environ.get("CALLBACK_BASE_URL", "https://example.com")
 
+# --- Chatfuel Broadcasting API settings ---
+# These let this server send a message BACK to a specific customer once
+# their payment is confirmed. Get these from Chatfuel: Settings -> API.
+CHATFUEL_BOT_ID = os.environ.get("CHATFUEL_BOT_ID")
+CHATFUEL_TOKEN = os.environ.get("CHATFUEL_TOKEN")
+# The name of the Chatfuel block that shows the "payment confirmed" message
+# and the Facebook Group link. Create this block in Chatfuel first (see guide).
+CHATFUEL_CONFIRMATION_BLOCK = os.environ.get(
+    "CHATFUEL_CONFIRMATION_BLOCK", "Payment Confirmed"
+)
+
 
 def get_qpay_settings() -> QPaySettings:
     if QPAY_ENV == "production":
@@ -84,6 +97,26 @@ def get_qpay_settings() -> QPaySettings:
 # testing, but for a real business you'd swap this for a real database
 # later (a developer can help with that step when you're ready).
 INVOICES: dict[str, dict] = {}
+
+
+async def notify_chatfuel_payment_confirmed(user_id: str) -> None:
+    """
+    Tells Chatfuel to send the 'Payment Confirmed' block to this specific
+    user. This is what actually delivers the Facebook Group link (or
+    whatever else you put in that block) back to the customer.
+    """
+    if not CHATFUEL_BOT_ID or not CHATFUEL_TOKEN:
+        # Not configured yet -- skip silently so the QPay callback still
+        # succeeds. See the guide for how to set these two values.
+        return
+
+    url = f"https://api.chatfuel.com/bots/{CHATFUEL_BOT_ID}/users/{user_id}/send"
+    params = {
+        "chatfuel_token": CHATFUEL_TOKEN,
+        "chatfuel_block_name": CHATFUEL_CONFIRMATION_BLOCK,
+    }
+    async with httpx.AsyncClient() as http_client:
+        await http_client.post(url, params=params)
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +208,10 @@ async def qpay_callback(order_id: str):
 
     if result.count > 0:
         record["status"] = "PAID"
-        # --- NEXT STEP FOR LATER ---
-        # This is the exact spot where, once you've connected a real
-        # chatbot API key, you'd send a message back to the customer like
-        # "Payment received! Your order is confirmed." A developer can
-        # add that call here when you're ready to wire it up.
+        # order_id is the customer's Facebook user_id (we set it that way
+        # in Chatfuel: "order_id": "{{user_id}}"), so we can message them
+        # back directly.
+        await notify_chatfuel_payment_confirmed(user_id=order_id)
 
     # QPay requires HTTP 200 with the exact text "SUCCESS" in response.
     return "SUCCESS"
