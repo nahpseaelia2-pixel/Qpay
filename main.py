@@ -24,6 +24,7 @@ import os
 from decimal import Decimal
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from qpay_client.v2 import AsyncQPayClient, QPaySettings
@@ -35,6 +36,16 @@ from qpay_client.v2.schemas import (
 )
 
 app = FastAPI(title="QPay Chatbot Bridge")
+
+# Allow browser-based tools (Hoppscotch, your future admin dashboard, etc.)
+# and your chatbot platform to call this server directly. Without this,
+# browsers silently block the request and show a generic "Network Error".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
