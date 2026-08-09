@@ -21,6 +21,7 @@ later, when you're ready to accept real money (see the guide).
 """
 
 import os
+import uuid
 from decimal import Decimal
 
 from fastapi import FastAPI, HTTPException
@@ -89,7 +90,7 @@ INVOICES: dict[str, dict] = {}
 # 1) CREATE INVOICE  -- called by your chatbot
 # ---------------------------------------------------------------------------
 class CreateInvoiceRequest(BaseModel):
-    order_id: str          # any unique ID you generate per order, e.g. "ORDER-1001"
+    order_id: str | None = None   # any unique ID, e.g. "ORDER-1001". Auto-generated if not given.
     amount: float           # amount in MNT (Mongolian Tugrik), e.g. 15000
     description: str        # shown to the customer, e.g. "1x Coffee Mug"
 
@@ -103,24 +104,29 @@ class CreateInvoiceResponse(BaseModel):
 
 @app.post("/create-invoice", response_model=CreateInvoiceResponse)
 async def create_invoice(payload: CreateInvoiceRequest):
+    # If Chatfuel didn't send a real order_id (e.g. its "Test the Request"
+    # preview button, which has no real user attached), generate one so
+    # the request still succeeds.
+    order_id = payload.order_id or f"AUTO-{uuid.uuid4().hex[:12]}"
+
     settings = get_qpay_settings()
 
     async with AsyncQPayClient(settings=settings) as client:
         invoice = await client.invoice_create(
             InvoiceCreateSimpleRequest(
-                sender_invoice_no=payload.order_id,
+                sender_invoice_no=order_id,
                 invoice_receiver_code="terminal",
                 invoice_description=payload.description,
                 amount=Decimal(str(payload.amount)),
                 callback_url=(
                     f"{CALLBACK_BASE_URL}/qpay-callback"
-                    f"?order_id={payload.order_id}"
+                    f"?order_id={order_id}"
                 ),
             )
         )
 
     # Remember this invoice so /qpay-callback can find it later.
-    INVOICES[payload.order_id] = {
+    INVOICES[order_id] = {
         "invoice_id": invoice.invoice_id,
         "status": "PENDING",
     }
