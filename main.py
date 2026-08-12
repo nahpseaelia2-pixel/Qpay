@@ -1,33 +1,44 @@
 """
-QPay Chatbot Bridge Server
+QPay + Meta Messenger Bot
 ---------------------------
-This small server sits between your chatbot (Chatfuel now, Meta Messenger
-later) and QPay. It does two jobs:
+This server IS your chatbot now -- it replaces Chatfuel entirely. It talks
+directly to Facebook/Messenger and to QPay. It does four jobs:
 
-1. POST /create-invoice
-   Your chatbot calls this when a customer wants to pay. This server asks
-   QPay to create an invoice and sends back a QR code (as an image URL and
-   as text) that the chatbot can show to the customer.
+1. GET /meta-webhook
+   A one-time handshake Meta uses to verify this server is really yours.
 
-2. POST /qpay-callback
-   QPay calls this automatically the moment a customer finishes paying.
-   This server double-checks the payment with QPay, then (later) will be
-   the place where we tell the chatbot to send a "Payment received!"
-   message back to the customer.
+2. POST /meta-webhook
+   Receives two kinds of events from Meta:
+     a) A comment on your Facebook Page post (if it matches your trigger
+        keywords, we privately reply with a "Pay" button)
+     b) A button click / postback (we create a QPay invoice and message
+        the customer a pay link)
 
-You should NOT need to edit this file to get started -- it already uses
-QPay's free SANDBOX (test) environment. Real credentials are only needed
-later, when you're ready to accept real money (see the guide).
+3. POST /qpay-callback
+   QPay calls this automatically when a customer finishes paying. This
+   server verifies the payment with QPay, then messages the customer
+   directly on Messenger with a confirmation + your Facebook Group link.
+
+4. POST /create-invoice, GET /payment-status/{order_id}
+   Kept from the earlier version -- useful for manual testing with tools
+   like Hoppscotch.
+
+You should NOT need to edit this file to get started -- it uses QPay's
+free SANDBOX environment by default. See the guide for the Meta setup
+steps (Page, App, tokens, webhook subscription).
 """
 
+import hashlib
+import hmac
+import json
 import os
 import uuid
 from decimal import Decimal
 
 import httpx
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from qpay_client.v2 import AsyncQPayClient, QPaySettings
@@ -38,11 +49,8 @@ from qpay_client.v2.schemas import (
     PaymentCheckRequest,
 )
 
-app = FastAPI(title="QPay Chatbot Bridge")
+app = FastAPI(title="QPay Meta Messenger Bot")
 
-# Allow browser-based tools (Hoppscotch, your future admin dashboard, etc.)
-# and your chatbot platform to call this server directly. Without this,
-# browsers silently block the request and show a generic "Network Error".
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,35 +59,38 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION -- all of this is set as Environment Variables on Render,
+# never edited directly in this file. See the guide for where to find each
+# value in Meta's App Dashboard / your Facebook Page settings.
 # ---------------------------------------------------------------------------
-# By default this runs against QPay's free SANDBOX environment using their
-# public test credentials -- no signup needed to try it out.
-#
-# When you're ready to go live, you set three environment variables on your
-# hosting platform (Render, etc.) instead of editing this file:
-#   QPAY_ENV=production
-#   QPAY_USERNAME=<your real QPay merchant username>
-#   QPAY_PASSWORD=<your real QPay merchant password>
-#   QPAY_INVOICE_CODE=<your real QPay invoice code>
-#
-# CALLBACK_BASE_URL must be set to the public URL of THIS server once it's
-# deployed (e.g. https://your-app-name.onrender.com). QPay uses this to know
-# where to send payment notifications.
 
 QPAY_ENV = os.environ.get("QPAY_ENV", "sandbox")
 CALLBACK_BASE_URL = os.environ.get("CALLBACK_BASE_URL", "https://example.com")
 
-# --- Chatfuel Broadcasting API settings ---
-# These let this server send a message BACK to a specific customer once
-# their payment is confirmed. Get these from Chatfuel: Settings -> API.
-CHATFUEL_BOT_ID = os.environ.get("CHATFUEL_BOT_ID")
-CHATFUEL_TOKEN = os.environ.get("CHATFUEL_TOKEN")
-# The name of the Chatfuel block that shows the "payment confirmed" message
-# and the Facebook Group link. Create this block in Chatfuel first (see guide).
-CHATFUEL_CONFIRMATION_BLOCK = os.environ.get(
-    "CHATFUEL_CONFIRMATION_BLOCK", "Payment Confirmed"
-)
+# --- Meta / Messenger settings ---
+META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")       # you make this up yourself
+META_PAGE_ACCESS_TOKEN = os.environ.get("META_PAGE_ACCESS_TOKEN", "")  # from Meta App Dashboard
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")           # from Meta App Dashboard
+GRAPH_API_VERSION = "v25.0"
+GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+
+# Comma-separated list, e.g. "price,order,buy" -- a comment matches if it
+# contains ANY of these words (case-insensitive). Mirrors your old Chatfuel
+# "Comments with keywords" trigger.
+TRIGGER_KEYWORDS = [
+    k.strip().lower()
+    for k in os.environ.get("META_TRIGGER_KEYWORDS", "").split(",")
+    if k.strip()
+]
+
+# What you're selling -- kept simple as one fixed product for now.
+PRODUCT_AMOUNT = float(os.environ.get("PRODUCT_AMOUNT", "15000"))
+PRODUCT_DESCRIPTION = os.environ.get("PRODUCT_DESCRIPTION", "Order")
+
+# The Facebook Group link sent after payment is confirmed.
+FACEBOOK_GROUP_LINK = os.environ.get("FACEBOOK_GROUP_LINK", "")
+
+PAY_BUTTON_PAYLOAD = "QPAY_PAY"
 
 
 def get_qpay_settings() -> QPaySettings:
@@ -92,97 +103,189 @@ def get_qpay_settings() -> QPaySettings:
     return QPaySettings.sandbox()
 
 
-# In-memory "database" of invoices we've created, so the callback step can
-# look them up. This resets every time the server restarts -- fine for
-# testing, but for a real business you'd swap this for a real database
-# later (a developer can help with that step when you're ready).
+# In-memory "database". Resets on restart -- fine for testing, swap for a
+# real database later.
 INVOICES: dict[str, dict] = {}
 
 
-async def notify_chatfuel_payment_confirmed(user_id: str) -> None:
-    """
-    Tells Chatfuel to send the 'Payment Confirmed' block to this specific
-    user. This is what actually delivers the Facebook Group link (or
-    whatever else you put in that block) back to the customer.
-    """
-    if not CHATFUEL_BOT_ID or not CHATFUEL_TOKEN:
-        # Not configured yet -- skip silently so the QPay callback still
-        # succeeds. See the guide for how to set these two values.
-        return
+# ---------------------------------------------------------------------------
+# META / MESSENGER HELPERS
+# ---------------------------------------------------------------------------
 
-    url = f"https://api.chatfuel.com/bots/{CHATFUEL_BOT_ID}/users/{user_id}/send"
-    params = {
-        "chatfuel_token": CHATFUEL_TOKEN,
-        "chatfuel_block_name": CHATFUEL_CONFIRMATION_BLOCK,
+def verify_meta_signature(raw_body: bytes, signature_header: str) -> None:
+    """
+    Confirms a webhook request genuinely came from Meta, not an impersonator.
+    Meta signs every request using your App Secret.
+    """
+    if not META_APP_SECRET:
+        return  # not configured yet -- skip verification (fine for early testing)
+
+    if not signature_header or not signature_header.startswith("sha256="):
+        raise HTTPException(status_code=403, detail="Missing signature")
+
+    expected = hmac.new(
+        META_APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    provided = signature_header.split("sha256=", 1)[1]
+
+    if not hmac.compare_digest(expected, provided):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+
+async def send_meta_message(recipient: dict, message: dict) -> None:
+    """
+    Low-level helper: POSTs to Meta's Send API.
+    `recipient` is either {"id": "<PSID>"} for a normal Messenger user,
+    or {"comment_id": "<comment id>"} for a private reply to a comment.
+    """
+    url = f"{GRAPH_API_BASE}/me/messages"
+    params = {"access_token": META_PAGE_ACCESS_TOKEN}
+    payload = {
+        "recipient": recipient,
+        "message": message,
+        "messaging_type": "RESPONSE",
     }
     async with httpx.AsyncClient() as http_client:
-        await http_client.post(url, params=params)
+        resp = await http_client.post(url, params=params, json=payload)
+        resp.raise_for_status()
 
 
-# ---------------------------------------------------------------------------
-# 1) CREATE INVOICE  -- called by your chatbot
-# ---------------------------------------------------------------------------
-class CreateInvoiceRequest(BaseModel):
-    order_id: str | None = None   # any unique ID, e.g. "ORDER-1001". Auto-generated if not given.
-    amount: float           # amount in MNT (Mongolian Tugrik), e.g. 15000
-    description: str        # shown to the customer, e.g. "1x Coffee Mug"
+async def send_pay_button(recipient: dict) -> None:
+    """Sends a message with a 'Pay Now' button that triggers the QPay flow."""
+    await send_meta_message(
+        recipient,
+        {
+            "attachment": {
+                "type": "template",
+                "payload": {
+                    "template_type": "button",
+                    "text": f"{PRODUCT_DESCRIPTION} -- {PRODUCT_AMOUNT:.0f}\u20ae",
+                    "buttons": [
+                        {
+                            "type": "postback",
+                            "title": "Pay with QPay",
+                            "payload": PAY_BUTTON_PAYLOAD,
+                        }
+                    ],
+                },
+            }
+        },
+    )
 
 
-class CreateInvoiceResponse(BaseModel):
-    invoice_id: str
-    qr_text: str
-    qr_image_base64: str
-    qpay_short_url: str | None = None
-
-
-@app.post("/create-invoice", response_model=CreateInvoiceResponse)
-async def create_invoice(payload: CreateInvoiceRequest):
-    # If Chatfuel didn't send a real order_id (e.g. its "Test the Request"
-    # preview button, which has no real user attached), generate one so
-    # the request still succeeds.
-    order_id = payload.order_id or f"AUTO-{uuid.uuid4().hex[:12]}"
-
+async def create_qpay_invoice(order_id: str, amount: float, description: str) -> dict:
+    """
+    Shared invoice-creation logic, used by both /create-invoice (manual
+    testing) and the real Messenger postback handler.
+    """
     settings = get_qpay_settings()
-
     async with AsyncQPayClient(settings=settings) as client:
         invoice = await client.invoice_create(
             InvoiceCreateSimpleRequest(
                 sender_invoice_no=order_id,
                 invoice_receiver_code="terminal",
-                invoice_description=payload.description,
-                amount=Decimal(str(payload.amount)),
-                callback_url=(
-                    f"{CALLBACK_BASE_URL}/qpay-callback"
-                    f"?order_id={order_id}"
-                ),
+                invoice_description=description,
+                amount=Decimal(str(amount)),
+                callback_url=f"{CALLBACK_BASE_URL}/qpay-callback?order_id={order_id}",
             )
         )
 
-    # Remember this invoice so /qpay-callback can find it later.
-    INVOICES[order_id] = {
+    INVOICES[order_id] = {"invoice_id": invoice.invoice_id, "status": "PENDING"}
+
+    return {
         "invoice_id": invoice.invoice_id,
-        "status": "PENDING",
+        "qr_text": invoice.qr_text,
+        "qr_image_base64": invoice.qr_image,
+        "qpay_short_url": getattr(invoice, "qPay_shortUrl", None),
     }
 
-    return CreateInvoiceResponse(
-        invoice_id=invoice.invoice_id,
-        qr_text=invoice.qr_text,
-        qr_image_base64=invoice.qr_image,
-        qpay_short_url=getattr(invoice, "qPay_shortUrl", None),
-    )
+
+async def notify_customer_payment_confirmed(psid: str) -> None:
+    """Messages the customer directly once QPay confirms their payment."""
+    text = "\U0001F389 Payment confirmed! Thanks for your order."
+    if FACEBOOK_GROUP_LINK:
+        text += f"\n\nJoin our group here: {FACEBOOK_GROUP_LINK}"
+    await send_meta_message({"id": psid}, {"text": text})
 
 
 # ---------------------------------------------------------------------------
-# 2) PAYMENT STATUS -- your chatbot can poll this to check "has this order
-#    been paid yet?" (useful if you're not ready to wire up the live
-#    callback-to-chat step yet)
+# 1) META WEBHOOK VERIFICATION (Meta calls this once, when you connect the
+#    webhook in the App Dashboard)
 # ---------------------------------------------------------------------------
-@app.get("/payment-status/{order_id}")
-async def payment_status(order_id: str):
-    record = INVOICES.get(order_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Unknown order_id")
-    return {"order_id": order_id, "status": record["status"]}
+@app.get("/meta-webhook")
+async def verify_meta_webhook(request: Request):
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == META_VERIFY_TOKEN:
+        return PlainTextResponse(content=challenge or "")
+
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+# ---------------------------------------------------------------------------
+# 2) META WEBHOOK EVENTS (comments + button clicks)
+# ---------------------------------------------------------------------------
+@app.post("/meta-webhook")
+async def receive_meta_webhook(request: Request):
+    raw_body = await request.body()
+    verify_meta_signature(raw_body, request.headers.get("X-Hub-Signature-256", ""))
+
+    data = json.loads(raw_body)
+
+    for entry in data.get("entry", []):
+        # -- Comments on your Page's posts --
+        for change in entry.get("changes", []):
+            if change.get("field") == "feed":
+                await handle_feed_change(change.get("value", {}))
+
+        # -- Messenger events: button clicks, messages --
+        for messaging_event in entry.get("messaging", []):
+            await handle_messaging_event(messaging_event)
+
+    return {"status": "ok"}
+
+
+async def handle_feed_change(value: dict) -> None:
+    """Triggered when someone comments on your Page's post."""
+    if value.get("item") != "comment" or value.get("verb") != "add":
+        return
+
+    comment_text = (value.get("message") or "").lower()
+    comment_id = value.get("comment_id")
+
+    if not comment_id:
+        return
+
+    if TRIGGER_KEYWORDS and not any(kw in comment_text for kw in TRIGGER_KEYWORDS):
+        return  # doesn't match any trigger keyword -- ignore
+
+    # Private-reply with the Pay button. Note: Meta allows only ONE private
+    # reply per comment, so retesting requires a fresh comment each time.
+    await send_pay_button({"comment_id": comment_id})
+
+
+async def handle_messaging_event(event: dict) -> None:
+    """Triggered for button clicks (postbacks) and regular messages."""
+    sender_id = event.get("sender", {}).get("id")
+    postback = event.get("postback")
+
+    if not sender_id or not postback:
+        return
+
+    if postback.get("payload") == PAY_BUTTON_PAYLOAD:
+        invoice = await create_qpay_invoice(
+            order_id=sender_id,
+            amount=PRODUCT_AMOUNT,
+            description=PRODUCT_DESCRIPTION,
+        )
+        link = invoice.get("qpay_short_url") or invoice.get("qr_text")
+        await send_meta_message(
+            {"id": sender_id},
+            {"text": f"Scan or tap to pay: {link}"},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -208,13 +311,44 @@ async def qpay_callback(order_id: str):
 
     if result.count > 0:
         record["status"] = "PAID"
-        # order_id is the customer's Facebook user_id (we set it that way
-        # in Chatfuel: "order_id": "{{user_id}}"), so we can message them
-        # back directly.
-        await notify_chatfuel_payment_confirmed(user_id=order_id)
+        # order_id IS the customer's Messenger PSID (we set it that way in
+        # handle_messaging_event above), so we can message them directly.
+        await notify_customer_payment_confirmed(psid=order_id)
 
-    # QPay requires HTTP 200 with the exact text "SUCCESS" in response.
     return "SUCCESS"
+
+
+# ---------------------------------------------------------------------------
+# 4) MANUAL TESTING ENDPOINTS (unchanged from the Chatfuel-era version --
+#    handy for testing with Hoppscotch without needing a real Messenger
+#    conversation)
+# ---------------------------------------------------------------------------
+class CreateInvoiceRequest(BaseModel):
+    order_id: str | None = None
+    amount: float
+    description: str
+
+
+class CreateInvoiceResponse(BaseModel):
+    invoice_id: str
+    qr_text: str
+    qr_image_base64: str
+    qpay_short_url: str | None = None
+
+
+@app.post("/create-invoice", response_model=CreateInvoiceResponse)
+async def create_invoice(payload: CreateInvoiceRequest):
+    order_id = payload.order_id or f"AUTO-{uuid.uuid4().hex[:12]}"
+    invoice = await create_qpay_invoice(order_id, payload.amount, payload.description)
+    return CreateInvoiceResponse(**invoice)
+
+
+@app.get("/payment-status/{order_id}")
+async def payment_status(order_id: str):
+    record = INVOICES.get(order_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Unknown order_id")
+    return {"order_id": order_id, "status": record["status"]}
 
 
 @app.get("/")
