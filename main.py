@@ -31,6 +31,7 @@ steps (Page, App, tokens, webhook subscription).
 import hashlib
 import hmac
 import json
+import logging
 import os
 import uuid
 from decimal import Decimal
@@ -48,6 +49,9 @@ from qpay_client.v2.schemas import (
     Offset,
     PaymentCheckRequest,
 )
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("qpay_bot")
 
 app = FastAPI(title="QPay Meta Messenger Bot")
 
@@ -147,6 +151,7 @@ async def send_meta_message(recipient: dict, message: dict) -> None:
     }
     async with httpx.AsyncClient() as http_client:
         resp = await http_client.post(url, params=params, json=payload)
+        logger.info("Meta Send API response: %s %s", resp.status_code, resp.text)
         resp.raise_for_status()
 
 
@@ -234,6 +239,7 @@ async def receive_meta_webhook(request: Request):
     verify_meta_signature(raw_body, request.headers.get("X-Hub-Signature-256", ""))
 
     data = json.loads(raw_body)
+    logger.info("Incoming webhook payload: %s", json.dumps(data))
 
     for entry in data.get("entry", []):
         # -- Comments on your Page's posts --
@@ -250,18 +256,30 @@ async def receive_meta_webhook(request: Request):
 
 async def handle_feed_change(value: dict) -> None:
     """Triggered when someone comments on your Page's post."""
+    logger.info("Feed change value: %s", json.dumps(value))
+
     if value.get("item") != "comment" or value.get("verb") != "add":
+        logger.info(
+            "Ignored: item=%r verb=%r (expected item='comment', verb='add')",
+            value.get("item"), value.get("verb"),
+        )
         return
 
     comment_text = (value.get("message") or "").lower()
     comment_id = value.get("comment_id")
 
     if not comment_id:
+        logger.info("Ignored: no comment_id in payload")
         return
 
     if TRIGGER_KEYWORDS and not any(kw in comment_text for kw in TRIGGER_KEYWORDS):
+        logger.info(
+            "No keyword match. comment_text=%r trigger_keywords=%r",
+            comment_text, TRIGGER_KEYWORDS,
+        )
         return  # doesn't match any trigger keyword -- ignore
 
+    logger.info("Keyword matched! Sending pay button to comment_id=%s", comment_id)
     # Private-reply with the Pay button. Note: Meta allows only ONE private
     # reply per comment, so retesting requires a fresh comment each time.
     await send_pay_button({"comment_id": comment_id})
