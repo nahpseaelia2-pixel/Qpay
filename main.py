@@ -306,7 +306,8 @@ async def handle_messaging_event(event: dict) -> None:
         link = invoice.get("qpay_short_url") or invoice.get("qr_text")
         await send_meta_message(
             {"id": sender_id},
-            {"text": f"Qpay-ээр төлөх бол энд дарна уу. Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний баруун дээд буланд байрлах 3н цэг ---> 2. Open in external browser гэж дарна уу: {link}"},
+            {"text": f"Qpay-ээр төлөх бол энд дарна уу. 
+            Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний баруун дээд буланд байрлах °°° дарж  ---> 2. Open in external browser гэж дарна уу: {link}"},
         )
 
 
