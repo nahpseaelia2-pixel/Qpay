@@ -134,7 +134,7 @@ def get_orders_sheet():
     return client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 
-def log_new_order(order_id: str, amount: float, description: str) -> None:
+def log_new_order(order_id: str, amount: float, description: str, customer_name: str = "") -> None:
     """Appends a new row to the orders sheet. Silently does nothing if
     Google Sheets isn't configured."""
     sheet = get_orders_sheet()
@@ -142,6 +142,7 @@ def log_new_order(order_id: str, amount: float, description: str) -> None:
         return
     sheet.append_row([
         order_id,
+        customer_name,
         description,
         amount,
         "PENDING",
@@ -157,9 +158,27 @@ def mark_order_paid(order_id: str) -> None:
         return
     try:
         cell = sheet.find(order_id)
-        sheet.update_cell(cell.row, 4, "PAID")  # column 4 = status
+        sheet.update_cell(cell.row, 5, "PAID")  # column 5 = status
     except Exception:
         pass  # order_id not found in the sheet -- ignore
+
+
+async def get_customer_name(psid: str) -> str:
+    """Fetches the customer's Facebook name via Meta's User Profile API.
+    Returns an empty string if unavailable (e.g. not configured, or Meta
+    declines to share it -- this can happen and is not an error)."""
+    if not META_PAGE_ACCESS_TOKEN:
+        return ""
+    url = f"{GRAPH_API_BASE}/{psid}"
+    params = {"fields": "first_name,last_name", "access_token": META_PAGE_ACCESS_TOKEN}
+    try:
+        async with httpx.AsyncClient() as http_client:
+            resp = await http_client.get(url, params=params)
+            data = resp.json()
+        name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
+        return name
+    except Exception:
+        return ""
 
 
 # In-memory "database". Resets on restart -- fine for testing, swap for a
@@ -233,7 +252,9 @@ async def send_pay_button(recipient: dict) -> None:
     )
 
 
-async def create_qpay_invoice(order_id: str, amount: float, description: str) -> dict:
+async def create_qpay_invoice(
+    order_id: str, amount: float, description: str, customer_name: str = ""
+) -> dict:
     """
     Shared invoice-creation logic, used by both /create-invoice (manual
     testing) and the real Messenger postback handler.
@@ -251,7 +272,7 @@ async def create_qpay_invoice(order_id: str, amount: float, description: str) ->
         )
 
     INVOICES[order_id] = {"invoice_id": invoice.invoice_id, "status": "PENDING"}
-    log_new_order(order_id, amount, description)
+    log_new_order(order_id, amount, description, customer_name)
 
     return {
         "invoice_id": invoice.invoice_id,
@@ -350,10 +371,12 @@ async def handle_messaging_event(event: dict) -> None:
         return
 
     if postback.get("payload") == PAY_BUTTON_PAYLOAD:
+        customer_name = await get_customer_name(sender_id)
         invoice = await create_qpay_invoice(
             order_id=sender_id,
             amount=PRODUCT_AMOUNT,
             description=PRODUCT_DESCRIPTION,
+            customer_name=customer_name,
         )
         link = invoice.get("qpay_short_url") or invoice.get("qr_text")
         await send_meta_message(
