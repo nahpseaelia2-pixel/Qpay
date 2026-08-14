@@ -103,8 +103,11 @@ CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
 
 # Google Sheets logging (optional -- if not configured, orders just aren't
 # logged anywhere; the bot still works fine without this).
+# NOTE: we open the Sheet by its ID (not by name) -- opening by name requires
+# Google Drive API access too, while opening by ID only needs the Sheets
+# scope we already grant the service account, so this avoids an extra API.
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "")
-GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "QPay Orders")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 
 PAY_BUTTON_PAYLOAD = "QPAY_PAY"
 
@@ -122,13 +125,13 @@ def get_qpay_settings() -> QPaySettings:
 def get_orders_sheet():
     """Returns the first worksheet of the configured Google Sheet, or None
     if Google Sheets logging isn't set up."""
-    if not GOOGLE_SHEETS_CREDENTIALS_JSON:
+    if not GOOGLE_SHEETS_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
         return None
     creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
-    return client.open(GOOGLE_SHEET_NAME).sheet1
+    return client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 
 def log_new_order(order_id: str, amount: float, description: str) -> None:
