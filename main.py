@@ -211,7 +211,7 @@ async def create_qpay_invoice(order_id: str, amount: float, description: str) ->
 
 async def notify_customer_payment_confirmed(psid: str) -> None:
     """Messages the customer directly once QPay confirms their payment."""
-    text = "\U0001F389 Төлбөр төлөгдлөө!
+    text = "\U0001F389 Төлбөр төлөгдлөө!"
     if FACEBOOK_GROUP_LINK:
         text += f"\n\nЭнэхүү Группд нэгдэж үргэлжлүүлэн үзээрэй: {FACEBOOK_GROUP_LINK}"
     await send_meta_message({"id": psid}, {"text": text})
