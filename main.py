@@ -34,12 +34,15 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 
+import gspread
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
+from google.oauth2.service_account import Credentials
 from pydantic import BaseModel
 
 from qpay_client.v2 import AsyncQPayClient, QPaySettings
@@ -98,6 +101,11 @@ FACEBOOK_GROUP_LINK = os.environ.get("FACEBOOK_GROUP_LINK", "")
 BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "This business")
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
 
+# Google Sheets logging (optional -- if not configured, orders just aren't
+# logged anywhere; the bot still works fine without this).
+GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "")
+GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "QPay Orders")
+
 PAY_BUTTON_PAYLOAD = "QPAY_PAY"
 
 
@@ -109,6 +117,46 @@ def get_qpay_settings() -> QPaySettings:
             invoice_code=os.environ["QPAY_INVOICE_CODE"],
         )
     return QPaySettings.sandbox()
+
+
+def get_orders_sheet():
+    """Returns the first worksheet of the configured Google Sheet, or None
+    if Google Sheets logging isn't set up."""
+    if not GOOGLE_SHEETS_CREDENTIALS_JSON:
+        return None
+    creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    return client.open(GOOGLE_SHEET_NAME).sheet1
+
+
+def log_new_order(order_id: str, amount: float, description: str) -> None:
+    """Appends a new row to the orders sheet. Silently does nothing if
+    Google Sheets isn't configured."""
+    sheet = get_orders_sheet()
+    if not sheet:
+        return
+    sheet.append_row([
+        order_id,
+        description,
+        amount,
+        "PENDING",
+        datetime.now(timezone.utc).isoformat(),
+    ])
+
+
+def mark_order_paid(order_id: str) -> None:
+    """Updates the matching row's status to PAID. Silently does nothing if
+    Google Sheets isn't configured or the order_id isn't found."""
+    sheet = get_orders_sheet()
+    if not sheet:
+        return
+    try:
+        cell = sheet.find(order_id)
+        sheet.update_cell(cell.row, 4, "PAID")  # column 4 = status
+    except Exception:
+        pass  # order_id not found in the sheet -- ignore
 
 
 # In-memory "database". Resets on restart -- fine for testing, swap for a
@@ -200,6 +248,7 @@ async def create_qpay_invoice(order_id: str, amount: float, description: str) ->
         )
 
     INVOICES[order_id] = {"invoice_id": invoice.invoice_id, "status": "PENDING"}
+    log_new_order(order_id, amount, description)
 
     return {
         "invoice_id": invoice.invoice_id,
@@ -306,7 +355,7 @@ async def handle_messaging_event(event: dict) -> None:
         link = invoice.get("qpay_short_url") or invoice.get("qr_text")
         await send_meta_message(
             {"id": sender_id},
-            {"text": f"Qpay-ээр төлөх бол энд дарна уу: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах °°° дарж  2. Open in external browser гэж дарна уу."},
+            {"text": f"Qpay-ээр төлөх бол энд дарна уу: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж 2. Open in external browser гэж дарна уу."},
         )
 
 
@@ -333,6 +382,7 @@ async def qpay_callback(order_id: str):
 
     if result.count > 0:
         record["status"] = "PAID"
+        mark_order_paid(order_id)
         # order_id IS the customer's Messenger PSID (we set it that way in
         # handle_messaging_event above), so we can message them directly.
         await notify_customer_payment_confirmed(psid=order_id)
