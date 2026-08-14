@@ -172,7 +172,7 @@ async def send_pay_button(recipient: dict) -> None:
                     "buttons": [
                         {
                             "type": "postback",
-                            "title": "Pay with QPay",
+                            "title": "Qpay-ээр төлөх",
                             "payload": PAY_BUTTON_PAYLOAD,
                         }
                     ],
