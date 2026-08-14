@@ -307,7 +307,7 @@ async def handle_messaging_event(event: dict) -> None:
         await send_meta_message(
             {"id": sender_id},
             {"text": f "Qpay-ээр төлөх бол энд дарна уу
-            Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах °°° дарж  ---> 2. Open in external browser гэж дарна уу: {link}"},
+            Хэрэв алдаа заасан тохиолдолд -Дэлгэцний буланд байрлах °°° дарж  -Open in external browser гэж дарна уу: {link}"},
         )
 
 
