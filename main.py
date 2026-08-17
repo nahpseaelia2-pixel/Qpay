@@ -2,22 +2,43 @@
 QPay + Meta Messenger Bot
 ---------------------------
 This server IS your chatbot now -- it replaces Chatfuel entirely. It talks
-directly to Facebook/Messenger and to QPay. It does four jobs:
+directly to Facebook/Messenger and to QPay.
+
+Supports MULTIPLE PRODUCTS, each with its own trigger keyword(s), price,
+description, and destination Facebook Group. Configure products via
+environment variables on Render:
+
+    PRODUCT_1_KEYWORDS=no.1,no1
+    PRODUCT_1_AMOUNT=15000
+    PRODUCT_1_DESCRIPTION=Product 1
+    PRODUCT_1_GROUP_LINK=https://facebook.com/groups/xxxx
+    PRODUCT_1_VIDEO_FILE_ID=1a2B3cDeFgHiJkLmNoPqRsTuVwXyZ  (optional -- Google Drive file ID)
+
+    PRODUCT_2_KEYWORDS=no.2,no2
+    PRODUCT_2_AMOUNT=20000
+    PRODUCT_2_DESCRIPTION=Product 2
+    PRODUCT_2_GROUP_LINK=https://facebook.com/groups/yyyy
+
+    ...and so on (PRODUCT_3_..., PRODUCT_4_..., no limit).
+
+It does four jobs:
 
 1. GET /meta-webhook
    A one-time handshake Meta uses to verify this server is really yours.
 
 2. POST /meta-webhook
    Receives two kinds of events from Meta:
-     a) A comment on your Facebook Page post (if it matches your trigger
-        keywords, we privately reply with a "Pay" button)
-     b) A button click / postback (we create a QPay invoice and message
-        the customer a pay link)
+     a) A comment on your Facebook Page post -- checked against every
+        configured product's keywords. First match wins; we privately
+        reply with a "Pay" button for that specific product.
+     b) A button click / postback -- we create a QPay invoice for that
+        product and message the customer a pay link.
 
 3. POST /qpay-callback
    QPay calls this automatically when a customer finishes paying. This
    server verifies the payment with QPay, then messages the customer
-   directly on Messenger with a confirmation + your Facebook Group link.
+   directly on Messenger with a confirmation + THAT PRODUCT's Facebook
+   Group link.
 
 4. POST /create-invoice, GET /payment-status/{order_id}
    Kept from the earlier version -- useful for manual testing with tools
@@ -34,6 +55,7 @@ import json
 import logging
 import os
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -41,9 +63,11 @@ import gspread
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.service_account import Credentials
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from qpay_client.v2 import AsyncQPayClient, QPaySettings
 from qpay_client.v2.enums import ObjectType
@@ -81,20 +105,8 @@ META_APP_SECRET = os.environ.get("META_APP_SECRET", "")           # from Meta Ap
 GRAPH_API_VERSION = "v25.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
-# Comma-separated list, e.g. "price,order,buy" -- a comment matches if it
-# contains ANY of these words (case-insensitive). Mirrors your old Chatfuel
-# "Comments with keywords" trigger.
-TRIGGER_KEYWORDS = [
-    k.strip().lower()
-    for k in os.environ.get("META_TRIGGER_KEYWORDS", "").split(",")
-    if k.strip()
-]
-
-# What you're selling -- kept simple as one fixed product for now.
-PRODUCT_AMOUNT = float(os.environ.get("PRODUCT_AMOUNT", "15000"))
-PRODUCT_DESCRIPTION = os.environ.get("PRODUCT_DESCRIPTION", "Order")
-
-# The Facebook Group link sent after payment is confirmed.
+# Fallback Facebook Group link, used only if a specific product doesn't
+# have its own PRODUCT_N_GROUP_LINK set.
 FACEBOOK_GROUP_LINK = os.environ.get("FACEBOOK_GROUP_LINK", "")
 
 # Shown on the /privacy page. Fill these in with your real details.
@@ -109,7 +121,75 @@ CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 
-PAY_BUTTON_PAYLOAD = "QPAY_PAY"
+# --- Video delivery settings ---
+# Videos are stored in Google Drive and served through THIS server via a
+# time-limited token, reusing the SAME service account/credentials already
+# set up for Google Sheets above -- no separate storage account needed.
+# The only extra step is enabling the Google Drive API on the same Google
+# Cloud project, and sharing each video file with the service account's
+# email (Viewer access).
+# How long a video link stays valid after being sent to a customer.
+VIDEO_LINK_EXPIRY_HOURS = float(os.environ.get("VIDEO_LINK_EXPIRY_HOURS", "48"))
+
+
+@dataclass
+class Product:
+    index: int
+    keywords: list[str]
+    amount: float
+    description: str
+    group_link: str
+    video_file_id: str = ""  # Google Drive file ID for this product's video, e.g. "1a2B3c..."
+
+    @property
+    def payload(self) -> str:
+        """The postback payload used on this product's Pay button, e.g.
+        'QPAY_PAY_1', 'QPAY_PAY_2'."""
+        return f"QPAY_PAY_{self.index}"
+
+
+def load_products() -> list[Product]:
+    """Reads PRODUCT_1_..., PRODUCT_2_..., etc. from environment variables.
+    Stops at the first missing number, so products must be numbered without
+    gaps starting from 1.
+
+    Falls back to the old single-product variables (META_TRIGGER_KEYWORDS,
+    PRODUCT_AMOUNT, PRODUCT_DESCRIPTION, FACEBOOK_GROUP_LINK) as "product 1"
+    if no PRODUCT_1_KEYWORDS is set, so existing setups keep working
+    unchanged.
+    """
+    products: list[Product] = []
+    i = 1
+    while True:
+        keywords_raw = os.environ.get(f"PRODUCT_{i}_KEYWORDS")
+        if not keywords_raw:
+            break
+        keywords = [k.strip().lower() for k in keywords_raw.split(",") if k.strip()]
+        amount = float(os.environ.get(f"PRODUCT_{i}_AMOUNT", "0"))
+        description = os.environ.get(f"PRODUCT_{i}_DESCRIPTION", f"Product {i}")
+        group_link = os.environ.get(f"PRODUCT_{i}_GROUP_LINK", "")
+        video_file_id = os.environ.get(f"PRODUCT_{i}_VIDEO_FILE_ID", "")
+        products.append(Product(i, keywords, amount, description, group_link, video_file_id))
+        i += 1
+
+    if not products:
+        legacy_keywords = [
+            k.strip().lower()
+            for k in os.environ.get("META_TRIGGER_KEYWORDS", "").split(",")
+            if k.strip()
+        ]
+        products.append(Product(
+            index=1,
+            keywords=legacy_keywords,
+            amount=float(os.environ.get("PRODUCT_AMOUNT", "15000")),
+            description=os.environ.get("PRODUCT_DESCRIPTION", "Order"),
+            group_link=os.environ.get("FACEBOOK_GROUP_LINK", ""),
+        ))
+
+    return products
+
+
+PRODUCTS = load_products()
 
 
 def get_qpay_settings() -> QPaySettings:
@@ -132,6 +212,45 @@ def get_orders_sheet():
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
     return client.open_by_key(GOOGLE_SHEET_ID).sheet1
+
+
+def _refresh_drive_credentials() -> Credentials | None:
+    """Blocking helper (run in a thread pool) that refreshes a Google
+    service-account token with Drive read access, reusing the same
+    credentials JSON already configured for Sheets."""
+    if not GOOGLE_SHEETS_CREDENTIALS_JSON:
+        return None
+    creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    creds.refresh(GoogleAuthRequest())
+    return creds
+
+
+async def get_drive_access_token() -> str | None:
+    """Returns a valid access token for reading video files from Google
+    Drive, or None if not configured."""
+    creds = await run_in_threadpool(_refresh_drive_credentials)
+    return creds.token if creds else None
+
+
+# In-memory record of video-delivery tokens. Resets on restart -- fine for
+# testing, swap for a real database later.
+VIDEO_TOKENS: dict[str, dict] = {}
+
+
+def create_video_token(video_file_id: str) -> str:
+    """Creates a random, hard-to-guess token that grants access to a
+    specific video for a limited time. Returns the token."""
+    token = uuid.uuid4().hex
+    VIDEO_TOKENS[token] = {
+        "video_file_id": video_file_id,
+        "created_at": datetime.now(timezone.utc),
+    }
+    return token
 
 
 def log_new_order(order_id: str, amount: float, description: str, customer_name: str = "") -> None:
@@ -229,8 +348,8 @@ async def send_meta_message(recipient: dict, message: dict) -> None:
         resp.raise_for_status()
 
 
-async def send_pay_button(recipient: dict) -> None:
-    """Sends a message with a 'Pay Now' button that triggers the QPay flow."""
+async def send_pay_button(recipient: dict, product: Product) -> None:
+    """Sends a message with a 'Pay Now' button for a SPECIFIC product."""
     await send_meta_message(
         recipient,
         {
@@ -238,12 +357,12 @@ async def send_pay_button(recipient: dict) -> None:
                 "type": "template",
                 "payload": {
                     "template_type": "button",
-                    "text": f"{PRODUCT_DESCRIPTION} -- {PRODUCT_AMOUNT:.0f}\u20ae",
+                    "text": f"{product.description} -- {product.amount:.0f}\u20ae",
                     "buttons": [
                         {
                             "type": "postback",
                             "title": "Qpay-ээр төлөх",
-                            "payload": PAY_BUTTON_PAYLOAD,
+                            "payload": product.payload,
                         }
                     ],
                 },
@@ -253,7 +372,13 @@ async def send_pay_button(recipient: dict) -> None:
 
 
 async def create_qpay_invoice(
-    order_id: str, amount: float, description: str, customer_name: str = ""
+    order_id: str,
+    amount: float,
+    description: str,
+    customer_name: str = "",
+    psid: str = "",
+    group_link: str = "",
+    video_file_id: str = "",
 ) -> dict:
     """
     Shared invoice-creation logic, used by both /create-invoice (manual
@@ -271,7 +396,15 @@ async def create_qpay_invoice(
             )
         )
 
-    INVOICES[order_id] = {"invoice_id": invoice.invoice_id, "status": "PENDING"}
+    INVOICES[order_id] = {
+        "invoice_id": invoice.invoice_id,
+        "status": "PENDING",
+        # psid defaults to order_id for the manual /create-invoice testing
+        # endpoint, where there's no real Messenger user behind the order.
+        "psid": psid or order_id,
+        "group_link": group_link,
+        "video_file_id": video_file_id,
+    }
     log_new_order(order_id, amount, description, customer_name)
 
     return {
@@ -282,11 +415,21 @@ async def create_qpay_invoice(
     }
 
 
-async def notify_customer_payment_confirmed(psid: str) -> None:
+async def notify_customer_payment_confirmed(
+    psid: str, group_link: str = "", video_file_id: str = ""
+) -> None:
     """Messages the customer directly once QPay confirms their payment."""
     text = "\U0001F389 Төлбөр төлөгдлөө!"
-    if FACEBOOK_GROUP_LINK:
-        text += f"\n\nЭнэхүү Группд нэгдэж үргэлжлүүлэн үзээрэй: {FACEBOOK_GROUP_LINK}"
+    link = group_link or FACEBOOK_GROUP_LINK
+    if link:
+        text += f"\n\nЭнэхүү Группд нэгдэж үргэлжлүүлэн үзээрэй: {link}"
+    if video_file_id:
+        token = create_video_token(video_file_id)
+        video_link = f"{CALLBACK_BASE_URL}/video/{token}"
+        text += (
+            f"\n\nВидеог доорх холбоосоор үзнэ үү "
+            f"({VIDEO_LINK_EXPIRY_HOURS:.0f} цагийн дотор хүчинтэй): {video_link}"
+        )
     await send_meta_message({"id": psid}, {"text": text})
 
 
@@ -331,6 +474,15 @@ async def receive_meta_webhook(request: Request):
     return {"status": "ok"}
 
 
+def find_matching_product(comment_text: str) -> Product | None:
+    """Checks the comment against every configured product's keywords, in
+    order. Returns the first match, or None if nothing matches."""
+    for product in PRODUCTS:
+        if product.keywords and any(kw in comment_text for kw in product.keywords):
+            return product
+    return None
+
+
 async def handle_feed_change(value: dict) -> None:
     """Triggered when someone comments on your Page's post."""
     logger.info("Feed change value: %s", json.dumps(value))
@@ -349,17 +501,18 @@ async def handle_feed_change(value: dict) -> None:
         logger.info("Ignored: no comment_id in payload")
         return
 
-    if TRIGGER_KEYWORDS and not any(kw in comment_text for kw in TRIGGER_KEYWORDS):
-        logger.info(
-            "No keyword match. comment_text=%r trigger_keywords=%r",
-            comment_text, TRIGGER_KEYWORDS,
-        )
-        return  # doesn't match any trigger keyword -- ignore
+    product = find_matching_product(comment_text)
+    if not product:
+        logger.info("No product keyword matched. comment_text=%r", comment_text)
+        return  # doesn't match any product's keywords -- ignore
 
-    logger.info("Keyword matched! Sending pay button to comment_id=%s", comment_id)
+    logger.info(
+        "Product %s matched! Sending pay button to comment_id=%s",
+        product.index, comment_id,
+    )
     # Private-reply with the Pay button. Note: Meta allows only ONE private
     # reply per comment, so retesting requires a fresh comment each time.
-    await send_pay_button({"comment_id": comment_id})
+    await send_pay_button({"comment_id": comment_id}, product)
 
 
 async def handle_messaging_event(event: dict) -> None:
@@ -370,19 +523,40 @@ async def handle_messaging_event(event: dict) -> None:
     if not sender_id or not postback:
         return
 
-    if postback.get("payload") == PAY_BUTTON_PAYLOAD:
-        customer_name = await get_customer_name(sender_id)
-        invoice = await create_qpay_invoice(
-            order_id=sender_id,
-            amount=PRODUCT_AMOUNT,
-            description=PRODUCT_DESCRIPTION,
-            customer_name=customer_name,
-        )
-        link = invoice.get("qpay_short_url") or invoice.get("qr_text")
-        await send_meta_message(
-            {"id": sender_id},
-            {"text": f"Qpay-ээр төлөх бол энд дарна уу: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж 2. Open in external browser гэж дарна уу."},
-        )
+    payload = postback.get("payload", "")
+    if not payload.startswith("QPAY_PAY_"):
+        return
+
+    try:
+        product_index = int(payload.replace("QPAY_PAY_", "", 1))
+    except ValueError:
+        return
+
+    product = next((p for p in PRODUCTS if p.index == product_index), None)
+    if not product:
+        logger.info("Postback for unknown product index=%s", product_index)
+        return
+
+    customer_name = await get_customer_name(sender_id)
+    # Unique order_id per purchase (not just the PSID) -- this way, if the
+    # same customer buys more than one product, each purchase gets tracked
+    # separately instead of overwriting the last one.
+    order_id = f"{sender_id}-{product_index}-{uuid.uuid4().hex[:6]}"
+
+    invoice = await create_qpay_invoice(
+        order_id=order_id,
+        amount=product.amount,
+        description=product.description,
+        customer_name=customer_name,
+        psid=sender_id,
+        group_link=product.group_link,
+        video_file_id=product.video_file_id,
+    )
+    link = invoice.get("qpay_short_url") or invoice.get("qr_text")
+    await send_meta_message(
+        {"id": sender_id},
+        {"text": f"Qpay-ээр төлөх бол энд дарна уу: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж 2. Open in external browser гэж дарна уу."},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -409,9 +583,11 @@ async def qpay_callback(order_id: str):
     if result.count > 0:
         record["status"] = "PAID"
         mark_order_paid(order_id)
-        # order_id IS the customer's Messenger PSID (we set it that way in
-        # handle_messaging_event above), so we can message them directly.
-        await notify_customer_payment_confirmed(psid=order_id)
+        await notify_customer_payment_confirmed(
+            psid=record.get("psid", order_id),
+            group_link=record.get("group_link", ""),
+            video_file_id=record.get("video_file_id", ""),
+        )
 
     return "SUCCESS"
 
@@ -449,9 +625,79 @@ async def payment_status(order_id: str):
     return {"order_id": order_id, "status": record["status"]}
 
 
+# ---------------------------------------------------------------------------
+# VIDEO DELIVERY -- time-limited links to videos stored in Google Drive,
+# reusing the same service-account credentials already set up for Sheets.
+# The customer never sees the real Drive file, only a token pointing at
+# THIS server. We check the token's age here, and only then stream the
+# actual video bytes through, so the underlying file location and any
+# direct Drive link are never exposed to the customer.
+# ---------------------------------------------------------------------------
+VIDEO_EXPIRED_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Link expired</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+         max-width: 480px; margin: 80px auto; padding: 0 20px; color: #222;
+         text-align: center; }
+  h1 { font-size: 1.4em; }
+</style>
+</head>
+<body>
+<h1>This link has expired</h1>
+<p>Please contact us if you still need access to your video.</p>
+</body>
+</html>
+"""
+
+
+@app.get("/video/{token}")
+async def get_video(token: str):
+    record = VIDEO_TOKENS.get(token)
+    if not record:
+        return HTMLResponse(content=VIDEO_EXPIRED_HTML, status_code=404)
+
+    age = datetime.now(timezone.utc) - record["created_at"]
+    if age.total_seconds() > VIDEO_LINK_EXPIRY_HOURS * 3600:
+        return HTMLResponse(content=VIDEO_EXPIRED_HTML, status_code=410)
+
+    access_token = await get_drive_access_token()
+    if not access_token:
+        raise HTTPException(status_code=503, detail="Video storage not configured")
+
+    file_id = record["video_file_id"]
+    drive_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+
+    client = httpx.AsyncClient()
+    req = client.build_request(
+        "GET", drive_url, headers={"Authorization": f"Bearer {access_token}"}
+    )
+    resp = await client.send(req, stream=True)
+
+    if resp.status_code != 200:
+        await resp.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Could not fetch video from storage")
+
+    async def stream_and_close():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_and_close(),
+        media_type=resp.headers.get("content-type", "video/mp4"),
+    )
+
+
 @app.get("/")
 async def health_check():
-    return {"status": "ok", "qpay_env": QPAY_ENV}
+    return {"status": "ok", "qpay_env": QPAY_ENV, "products_configured": len(PRODUCTS)}
 
 
 # ---------------------------------------------------------------------------
