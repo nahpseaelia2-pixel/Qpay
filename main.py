@@ -105,6 +105,12 @@ META_APP_SECRET = os.environ.get("META_APP_SECRET", "")           # from Meta Ap
 GRAPH_API_VERSION = "v25.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
+# Optional secret that guards the /test-send-video testing endpoint below.
+# If you set this, you must include ?secret=<the same value> when calling
+# that endpoint, so a stranger who finds the URL can't get free video
+# access. Leave unset while you're still testing if you want.
+TEST_ENDPOINT_SECRET = os.environ.get("TEST_ENDPOINT_SECRET", "")
+
 # Fallback Facebook Group link, used only if a specific product doesn't
 # have its own PRODUCT_N_GROUP_LINK set.
 FACEBOOK_GROUP_LINK = os.environ.get("FACEBOOK_GROUP_LINK", "")
@@ -623,6 +629,41 @@ async def payment_status(order_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Unknown order_id")
     return {"order_id": order_id, "status": record["status"]}
+
+
+@app.post("/test-send-video")
+async def test_send_video(psid: str, product_index: int = 1, secret: str = ""):
+    """
+    TEST-ONLY endpoint: sends a product's payment-confirmation message
+    (group link + time-limited video link) directly to a Messenger user,
+    WITHOUT requiring a real QPay payment.
+
+    Use this to confirm your Google Drive access, video tokens, and
+    Messenger delivery all work correctly, independent of whether a real
+    payment succeeded.
+
+    If TEST_ENDPOINT_SECRET is set, you must pass the matching ?secret=...
+    or this returns 403 -- this stops a stranger who finds your Render URL
+    from using this to get free video access once you're live.
+    """
+    if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+
+    product = next((p for p in PRODUCTS if p.index == product_index), None)
+    if not product:
+        raise HTTPException(status_code=404, detail=f"No product with index {product_index}")
+
+    await notify_customer_payment_confirmed(
+        psid=psid,
+        group_link=product.group_link,
+        video_file_id=product.video_file_id,
+    )
+    return {
+        "status": "sent",
+        "psid": psid,
+        "product_index": product_index,
+        "had_video": bool(product.video_file_id),
+    }
 
 
 # ---------------------------------------------------------------------------
