@@ -12,7 +12,7 @@ environment variables on Render:
     PRODUCT_1_AMOUNT=15000
     PRODUCT_1_DESCRIPTION=Product 1
     PRODUCT_1_GROUP_LINK=https://facebook.com/groups/xxxx
-    PRODUCT_1_VIDEO_FILE_ID=1a2B3cDeFgHiJkLmNoPqRsTuVwXyZ  (optional -- Google Drive file ID)
+    PRODUCT_1_VIDEO_KEY=videos/product1.mp4  (optional -- object key in your R2 bucket)
 
     PRODUCT_2_KEYWORDS=no.2,no2
     PRODUCT_2_AMOUNT=20000
@@ -61,13 +61,14 @@ from decimal import Decimal
 
 import gspread
 import httpx
+import boto3
+from botocore.config import Config as BotoConfig
+from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
-from google.auth.transport.requests import Request as GoogleAuthRequest
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from google.oauth2.service_account import Credentials
 from pydantic import BaseModel
-from starlette.concurrency import run_in_threadpool
 
 from qpay_client.v2 import AsyncQPayClient, QPaySettings
 from qpay_client.v2.enums import ObjectType
@@ -127,14 +128,17 @@ CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 
-# --- Video delivery settings ---
-# Videos are stored in Google Drive and served through THIS server via a
-# time-limited token, reusing the SAME service account/credentials already
-# set up for Google Sheets above -- no separate storage account needed.
-# The only extra step is enabling the Google Drive API on the same Google
-# Cloud project, and sharing each video file with the service account's
-# email (Viewer access).
-# How long a video link stays valid after being sent to a customer.
+# --- Video delivery settings (Cloudflare R2) ---
+# Videos are stored in a Cloudflare R2 bucket. When a customer pays, we
+# generate a time-limited token; clicking it hits THIS server, which
+# checks the token, then redirects to a short-lived, real presigned R2
+# link. R2 has zero egress fees, so bandwidth costs nothing regardless of
+# video length or how many customers watch.
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "")
+# How long a video LINK (the one sent to the customer) stays valid.
 VIDEO_LINK_EXPIRY_HOURS = float(os.environ.get("VIDEO_LINK_EXPIRY_HOURS", "48"))
 
 
@@ -145,7 +149,7 @@ class Product:
     amount: float
     description: str
     group_link: str
-    video_file_id: str = ""  # Google Drive file ID for this product's video, e.g. "1a2B3c..."
+    video_key: str = ""  # object key (filename/path) of this product's video in R2, e.g. "videos/product1.mp4"
 
     @property
     def payload(self) -> str:
@@ -174,8 +178,8 @@ def load_products() -> list[Product]:
         amount = float(os.environ.get(f"PRODUCT_{i}_AMOUNT", "0"))
         description = os.environ.get(f"PRODUCT_{i}_DESCRIPTION", f"Product {i}")
         group_link = os.environ.get(f"PRODUCT_{i}_GROUP_LINK", "")
-        video_file_id = os.environ.get(f"PRODUCT_{i}_VIDEO_FILE_ID", "")
-        products.append(Product(i, keywords, amount, description, group_link, video_file_id))
+        video_key = os.environ.get(f"PRODUCT_{i}_VIDEO_KEY", "")
+        products.append(Product(i, keywords, amount, description, group_link, video_key))
         i += 1
 
     if not products:
@@ -220,27 +224,19 @@ def get_orders_sheet():
     return client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 
-def _refresh_drive_credentials() -> Credentials | None:
-    """Blocking helper (run in a thread pool) that refreshes a Google
-    service-account token with Drive read access, reusing the same
-    credentials JSON already configured for Sheets."""
-    if not GOOGLE_SHEETS_CREDENTIALS_JSON:
+def get_r2_client():
+    """Returns a boto3 S3-compatible client pointed at your Cloudflare R2
+    bucket, or None if R2 isn't configured."""
+    if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY):
         return None
-    creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    creds.refresh(GoogleAuthRequest())
-    return creds
-
-
-async def get_drive_access_token() -> str | None:
-    """Returns a valid access token for reading video files from Google
-    Drive, or None if not configured."""
-    creds = await run_in_threadpool(_refresh_drive_credentials)
-    return creds.token if creds else None
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=BotoConfig(signature_version="s3v4"),
+        region_name="auto",
+    )
 
 
 # In-memory record of video-delivery tokens. Resets on restart -- fine for
@@ -248,12 +244,12 @@ async def get_drive_access_token() -> str | None:
 VIDEO_TOKENS: dict[str, dict] = {}
 
 
-def create_video_token(video_file_id: str) -> str:
+def create_video_token(video_key: str) -> str:
     """Creates a random, hard-to-guess token that grants access to a
     specific video for a limited time. Returns the token."""
     token = uuid.uuid4().hex
     VIDEO_TOKENS[token] = {
-        "video_file_id": video_file_id,
+        "video_key": video_key,
         "created_at": datetime.now(timezone.utc),
     }
     return token
@@ -384,7 +380,7 @@ async def create_qpay_invoice(
     customer_name: str = "",
     psid: str = "",
     group_link: str = "",
-    video_file_id: str = "",
+    video_key: str = "",
 ) -> dict:
     """
     Shared invoice-creation logic, used by both /create-invoice (manual
@@ -409,7 +405,7 @@ async def create_qpay_invoice(
         # endpoint, where there's no real Messenger user behind the order.
         "psid": psid or order_id,
         "group_link": group_link,
-        "video_file_id": video_file_id,
+        "video_key": video_key,
     }
     log_new_order(order_id, amount, description, customer_name)
 
@@ -422,15 +418,15 @@ async def create_qpay_invoice(
 
 
 async def notify_customer_payment_confirmed(
-    psid: str, group_link: str = "", video_file_id: str = ""
+    psid: str, group_link: str = "", video_key: str = ""
 ) -> None:
     """Messages the customer directly once QPay confirms their payment."""
     text = "\U0001F389 Төлбөр төлөгдлөө!"
     link = group_link or FACEBOOK_GROUP_LINK
     if link:
         text += f"\n\nЭнэхүү Группд нэгдэж үргэлжлүүлэн үзээрэй: {link}"
-    if video_file_id:
-        token = create_video_token(video_file_id)
+    if video_key:
+        token = create_video_token(video_key)
         video_link = f"{CALLBACK_BASE_URL}/video/{token}"
         text += (
             f"\n\nВидеог доорх холбоосоор үзнэ үү "
@@ -556,7 +552,7 @@ async def handle_messaging_event(event: dict) -> None:
         customer_name=customer_name,
         psid=sender_id,
         group_link=product.group_link,
-        video_file_id=product.video_file_id,
+        video_key=product.video_key,
     )
     link = invoice.get("qpay_short_url") or invoice.get("qr_text")
     await send_meta_message(
@@ -592,7 +588,7 @@ async def qpay_callback(order_id: str):
         await notify_customer_payment_confirmed(
             psid=record.get("psid", order_id),
             group_link=record.get("group_link", ""),
-            video_file_id=record.get("video_file_id", ""),
+            video_key=record.get("video_key", ""),
         )
 
     return "SUCCESS"
@@ -638,9 +634,9 @@ async def test_send_video(psid: str, product_index: int = 1, secret: str = ""):
     (group link + time-limited video link) directly to a Messenger user,
     WITHOUT requiring a real QPay payment.
 
-    Use this to confirm your Google Drive access, video tokens, and
-    Messenger delivery all work correctly, independent of whether a real
-    payment succeeded.
+    Use this to confirm your R2 credentials, video tokens, and Messenger
+    delivery all work correctly, independent of whether a real payment
+    succeeded.
 
     If TEST_ENDPOINT_SECRET is set, you must pass the matching ?secret=...
     or this returns 403 -- this stops a stranger who finds your Render URL
@@ -656,23 +652,23 @@ async def test_send_video(psid: str, product_index: int = 1, secret: str = ""):
     await notify_customer_payment_confirmed(
         psid=psid,
         group_link=product.group_link,
-        video_file_id=product.video_file_id,
+        video_key=product.video_key,
     )
     return {
         "status": "sent",
         "psid": psid,
         "product_index": product_index,
-        "had_video": bool(product.video_file_id),
+        "had_video": bool(product.video_key),
     }
 
 
 # ---------------------------------------------------------------------------
-# VIDEO DELIVERY -- time-limited links to videos stored in Google Drive,
-# reusing the same service-account credentials already set up for Sheets.
-# The customer never sees the real Drive file, only a token pointing at
-# THIS server. We check the token's age here, and only then stream the
-# actual video bytes through, so the underlying file location and any
-# direct Drive link are never exposed to the customer.
+# VIDEO DELIVERY -- time-limited links to videos stored in Cloudflare R2.
+# The customer never sees the real R2 URL, only a token pointing at THIS
+# server. We check the token's age here, and only then generate a short-
+# lived (5 minute) direct R2 link and redirect to it. R2 has zero egress
+# fees, so bandwidth for video streaming/downloading never touches Render
+# or costs anything, regardless of video length or view count.
 # ---------------------------------------------------------------------------
 VIDEO_EXPIRED_HTML = """
 <!DOCTYPE html>
@@ -695,7 +691,7 @@ VIDEO_EXPIRED_HTML = """
 
 
 @app.get("/video/{token}")
-async def get_video(token: str, request: Request):
+async def get_video(token: str):
     record = VIDEO_TOKENS.get(token)
     if not record:
         return HTMLResponse(content=VIDEO_EXPIRED_HTML, status_code=404)
@@ -704,53 +700,16 @@ async def get_video(token: str, request: Request):
     if age.total_seconds() > VIDEO_LINK_EXPIRY_HOURS * 3600:
         return HTMLResponse(content=VIDEO_EXPIRED_HTML, status_code=410)
 
-    access_token = await get_drive_access_token()
-    if not access_token:
+    r2_client = get_r2_client()
+    if not r2_client or not R2_BUCKET_NAME:
         raise HTTPException(status_code=503, detail="Video storage not configured")
 
-    file_id = record["video_file_id"]
-    drive_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-
-    # Forward the client's Range header (if any) to Google Drive. This is
-    # essential for video playback -- players like Messenger's in-app
-    # video player use Range requests to seek and to start playback
-    # smoothly. Without this, the player can fail or endlessly retry
-    # instead of actually playing the video.
-    headers = {"Authorization": f"Bearer {access_token}"}
-    range_header = request.headers.get("range")
-    if range_header:
-        headers["Range"] = range_header
-
-    client = httpx.AsyncClient()
-    req = client.build_request("GET", drive_url, headers=headers)
-    resp = await client.send(req, stream=True)
-
-    if resp.status_code not in (200, 206):
-        await resp.aclose()
-        await client.aclose()
-        raise HTTPException(status_code=502, detail="Could not fetch video from storage")
-
-    async def stream_and_close():
-        try:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-        finally:
-            await resp.aclose()
-            await client.aclose()
-
-    # Pass through the range-related headers from Drive's response so the
-    # video player understands this server supports seeking.
-    response_headers = {"accept-ranges": "bytes"}
-    for header_name in ("content-range", "content-length"):
-        if header_name in resp.headers:
-            response_headers[header_name] = resp.headers[header_name]
-
-    return StreamingResponse(
-        stream_and_close(),
-        status_code=resp.status_code,
-        media_type=resp.headers.get("content-type", "video/mp4"),
-        headers=response_headers,
+    presigned_url = r2_client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": record["video_key"]},
+        ExpiresIn=300,  # the actual R2 link is only valid for 5 minutes
     )
+    return RedirectResponse(url=presigned_url)
 
 
 @app.get("/")
