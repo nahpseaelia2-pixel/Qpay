@@ -116,6 +116,14 @@ TEST_ENDPOINT_SECRET = os.environ.get("TEST_ENDPOINT_SECRET", "")
 # have its own PRODUCT_N_GROUP_LINK set.
 FACEBOOK_GROUP_LINK = os.environ.get("FACEBOOK_GROUP_LINK", "")
 
+# Public reply posted under a comment when its keyword matches (visible to
+# everyone, in addition to the private Messenger message). Customize this
+# however you like.
+COMMENT_REPLY_TEXT = os.environ.get(
+    "COMMENT_REPLY_TEXT",
+    "Танд захиалгын мэдээллийг Messenger-ээр илгээлээ! \U0001F4E9",
+)
+
 # Shown on the /privacy page. Fill these in with your real details.
 BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "This business")
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
@@ -373,6 +381,31 @@ async def send_pay_button(recipient: dict, product: Product) -> None:
     )
 
 
+async def like_comment(comment_id: str) -> None:
+    """Likes a comment as the Page -- a visible thumbs-up reaction under
+    the comment. Requires the pages_manage_engagement permission on your
+    Page Access Token."""
+    url = f"{GRAPH_API_BASE}/{comment_id}/likes"
+    params = {"access_token": META_PAGE_ACCESS_TOKEN}
+    async with httpx.AsyncClient() as http_client:
+        resp = await http_client.post(url, params=params)
+        logger.info("Like comment response: %s %s", resp.status_code, resp.text)
+        resp.raise_for_status()
+
+
+async def reply_to_comment(comment_id: str, message: str) -> None:
+    """Posts a PUBLIC reply visible under the comment thread -- different
+    from the private Messenger message sent via send_pay_button. Also
+    requires pages_manage_engagement."""
+    url = f"{GRAPH_API_BASE}/{comment_id}/comments"
+    params = {"access_token": META_PAGE_ACCESS_TOKEN}
+    payload = {"message": message}
+    async with httpx.AsyncClient() as http_client:
+        resp = await http_client.post(url, params=params, json=payload)
+        logger.info("Reply to comment response: %s %s", resp.status_code, resp.text)
+        resp.raise_for_status()
+
+
 async def create_qpay_invoice(
     order_id: str,
     amount: float,
@@ -422,13 +455,15 @@ async def notify_customer_payment_confirmed(
 ) -> None:
     """Messages the customer directly once QPay confirms their payment."""
     text = "\U0001F389 Төлбөр төлөгдлөө!"
-
+    link = group_link or FACEBOOK_GROUP_LINK
+    if link:
+        text += f"\n\nЭнэхүү Группд нэгдэж үргэлжлүүлэн үзээрэй: {link}"
     if video_key:
         token = create_video_token(video_key)
         video_link = f"{CALLBACK_BASE_URL}/watch/{token}"
         text += (
-            f"\n\nКиног доорх холбоосоор орж үзнэ үү "
-            f" {video_link}"
+            f"\n\nВидеог доорх холбоосоор үзнэ үү "
+            f"({VIDEO_LINK_EXPIRY_HOURS:.0f} цагийн дотор хүчинтэй): {video_link}"
         )
     await send_meta_message({"id": psid}, {"text": text})
 
@@ -510,6 +545,20 @@ async def handle_feed_change(value: dict) -> None:
         "Product %s matched! Sending pay button to comment_id=%s",
         product.index, comment_id,
     )
+
+    # Like the comment and post a public reply, in addition to the private
+    # Messenger message. These are independent, best-effort actions -- if
+    # one fails, we still want the actual pay button to go out.
+    try:
+        await like_comment(comment_id)
+    except Exception as e:
+        logger.warning("Failed to like comment %s: %s", comment_id, e)
+
+    try:
+        await reply_to_comment(comment_id, COMMENT_REPLY_TEXT)
+    except Exception as e:
+        logger.warning("Failed to reply to comment %s: %s", comment_id, e)
+
     # Private-reply with the Pay button. Note: Meta allows only ONE private
     # reply per comment, so retesting requires a fresh comment each time.
     await send_pay_button({"comment_id": comment_id}, product)
@@ -555,7 +604,7 @@ async def handle_messaging_event(event: dict) -> None:
     link = invoice.get("qpay_short_url") or invoice.get("qr_text")
     await send_meta_message(
         {"id": sender_id},
-        {"text": f"Qpay-ээр төлөх: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж 2. Open in external browser гэж дарна уу."},
+        {"text": f"Qpay-ээр төлөх бол энд дарна уу: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж 2. Open in external browser гэж дарна уу."},
     )
 
 
