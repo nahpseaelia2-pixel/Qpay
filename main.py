@@ -121,7 +121,7 @@ FACEBOOK_GROUP_LINK = os.environ.get("FACEBOOK_GROUP_LINK", "")
 # however you like.
 COMMENT_REPLY_TEXT = os.environ.get(
     "COMMENT_REPLY_TEXT",
-    "Танд захиалгын мэдээллийг Messenger-ээр илгээлээ! \U0001F4E9",
+    "Танд мэдээллийг чатаар илгээлээ! \U0001F4E9",
 )
 
 # Shown on the /privacy page. Fill these in with your real details.
