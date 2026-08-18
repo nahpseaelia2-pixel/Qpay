@@ -695,7 +695,7 @@ VIDEO_EXPIRED_HTML = """
 
 
 @app.get("/video/{token}")
-async def get_video(token: str):
+async def get_video(token: str, request: Request):
     record = VIDEO_TOKENS.get(token)
     if not record:
         return HTMLResponse(content=VIDEO_EXPIRED_HTML, status_code=404)
@@ -711,13 +711,21 @@ async def get_video(token: str):
     file_id = record["video_file_id"]
     drive_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
 
+    # Forward the client's Range header (if any) to Google Drive. This is
+    # essential for video playback -- players like Messenger's in-app
+    # video player use Range requests to seek and to start playback
+    # smoothly. Without this, the player can fail or endlessly retry
+    # instead of actually playing the video.
+    headers = {"Authorization": f"Bearer {access_token}"}
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+
     client = httpx.AsyncClient()
-    req = client.build_request(
-        "GET", drive_url, headers={"Authorization": f"Bearer {access_token}"}
-    )
+    req = client.build_request("GET", drive_url, headers=headers)
     resp = await client.send(req, stream=True)
 
-    if resp.status_code != 200:
+    if resp.status_code not in (200, 206):
         await resp.aclose()
         await client.aclose()
         raise HTTPException(status_code=502, detail="Could not fetch video from storage")
@@ -730,9 +738,18 @@ async def get_video(token: str):
             await resp.aclose()
             await client.aclose()
 
+    # Pass through the range-related headers from Drive's response so the
+    # video player understands this server supports seeking.
+    response_headers = {"accept-ranges": "bytes"}
+    for header_name in ("content-range", "content-length"):
+        if header_name in resp.headers:
+            response_headers[header_name] = resp.headers[header_name]
+
     return StreamingResponse(
         stream_and_close(),
+        status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "video/mp4"),
+        headers=response_headers,
     )
 
 
