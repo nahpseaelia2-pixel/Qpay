@@ -427,7 +427,7 @@ async def notify_customer_payment_confirmed(
         text += f"\n\nЭнэхүү Группд нэгдэж үргэлжлүүлэн үзээрэй: {link}"
     if video_key:
         token = create_video_token(video_key)
-        video_link = f"{CALLBACK_BASE_URL}/video/{token}"
+        video_link = f"{CALLBACK_BASE_URL}/watch/{token}"
         text += (
             f"\n\nВидеог доорх холбоосоор үзнэ үү "
             f"({VIDEO_LINK_EXPIRY_HOURS:.0f} цагийн дотор хүчинтэй): {video_link}"
@@ -689,8 +689,47 @@ VIDEO_EXPIRED_HTML = """
 </html>
 """
 
+VIDEO_PLAYER_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Your video</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body {{ margin: 0; background: #000; height: 100vh; display: flex;
+          align-items: center; justify-content: center; }}
+  video {{ max-width: 100%; max-height: 100vh; }}
+</style>
+</head>
+<body>
+<video controls controlsList="nodownload noremoteplayback" disablePictureInPicture
+       oncontextmenu="return false;" playsinline>
+  <source src="/video-stream/{token}" type="video/mp4">
+  Your browser doesn't support video playback.
+</video>
+</body>
+</html>
+"""
 
-@app.get("/video/{token}")
+
+@app.get("/watch/{token}", response_class=HTMLResponse)
+async def watch_video(token: str):
+    """Serves a simple page with a custom video player (download button
+    disabled) instead of linking straight to the file -- linking directly
+    to a video file makes the BROWSER show its own native player, which
+    always includes a download button we can't remove. This wrapper page
+    gives us control over that."""
+    record = VIDEO_TOKENS.get(token)
+    if not record:
+        return HTMLResponse(content=VIDEO_EXPIRED_HTML, status_code=404)
+
+    age = datetime.now(timezone.utc) - record["created_at"]
+    if age.total_seconds() > VIDEO_LINK_EXPIRY_HOURS * 3600:
+        return HTMLResponse(content=VIDEO_EXPIRED_HTML, status_code=410)
+
+    return HTMLResponse(content=VIDEO_PLAYER_HTML.format(token=token))
+
+
+@app.get("/video-stream/{token}")
 async def get_video(token: str):
     record = VIDEO_TOKENS.get(token)
     if not record:
