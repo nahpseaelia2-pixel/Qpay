@@ -4,3 +4,4 @@ qpay-client
 httpx
 gspread
 google-auth
+boto3
