@@ -422,15 +422,13 @@ async def notify_customer_payment_confirmed(
 ) -> None:
     """Messages the customer directly once QPay confirms their payment."""
     text = "\U0001F389 Төлбөр төлөгдлөө!"
-    link = group_link or FACEBOOK_GROUP_LINK
-    if link:
-        text += f"\n\nЭнэхүү Группд нэгдэж үргэлжлүүлэн үзээрэй: {link}"
+
     if video_key:
         token = create_video_token(video_key)
         video_link = f"{CALLBACK_BASE_URL}/watch/{token}"
         text += (
-            f"\n\nВидеог доорх холбоосоор үзнэ үү "
-            f"({VIDEO_LINK_EXPIRY_HOURS:.0f} цагийн дотор хүчинтэй): {video_link}"
+            f"\n\nКиног доорх холбоосоор орж үзнэ үү "
+            f" {video_link}"
         )
     await send_meta_message({"id": psid}, {"text": text})
 
@@ -557,7 +555,7 @@ async def handle_messaging_event(event: dict) -> None:
     link = invoice.get("qpay_short_url") or invoice.get("qr_text")
     await send_meta_message(
         {"id": sender_id},
-        {"text": f"Qpay-ээр төлөх бол энд дарна уу: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж 2. Open in external browser гэж дарна уу."},
+        {"text": f"Qpay-ээр төлөх: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж 2. Open in external browser гэж дарна уу."},
     )
 
 
